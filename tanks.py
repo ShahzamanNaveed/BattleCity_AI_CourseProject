@@ -131,9 +131,15 @@ class PlayerTank(Tank):
 
 class BasicTank(Tank):
     """
-    Simple Reflex Agent.
-    Primary rule: shoot if player is in same row/col with clear LoS.
-    Movement: follow BFS path toward Eagle; re-plan every 5s or when blocked.
+    Simple Reflex Agent — no memory, no planning, pure reaction.
+    Primary Rule: IF player is in same row OR column AND no wall between
+                  THEN shoot.
+    Movement Rule: IF path to Eagle exists via BFS THEN follow next BFS step.
+                   ELSE turn to a random free direction.
+    Wall Rule: IF next tile in current direction is Brick THEN shoot to
+               destroy it, THEN resume movement.
+    BFS treats only passable tiles (Empty, Forest) as cost = 1.
+    Re-run BFS: (a) at spawn, (b) when path tile is blocked, (c) every 5s.
     """
 
     def __init__(self, x, y, level=1):
@@ -142,13 +148,13 @@ class BasicTank(Tank):
         self.fire_rate  = 120 if level == 1 else 90
         self.speed      = SPEED[TANK_BASIC] + (8 if level == 1 else 0)
         self._path      = []
-        self._replan_cd = 0
+        self._replan_cd = 0          # triggers BFS recompute
         self._sight_ticks = 0
 
     def update(self, tilemap, player, occupied=None):
         self.tick_cooldowns()
 
-        # Reflex rule — shoot player if visible
+        # ── Primary Rule (Simple Reflex): shoot player if in LoS ──────────
         if self.line_of_sight(tilemap, player.x, player.y):
             self._sight_ticks += 1
             if self._sight_ticks >= 60:
@@ -162,86 +168,99 @@ class BasicTank(Tank):
         else:
             self._sight_ticks = 0
 
-        # Replan timer
+        # ── BFS replan timer: at spawn, when blocked, every 5 seconds ─────
         self._replan_cd -= 1
         if self._replan_cd <= 0 or not self._path:
             self._path      = tilemap.bfs_path((self.x, self.y), EAGLE_POS)
             self._replan_cd = FPS * 5
 
-        # Wall rule — shoot brick blocking next step
-        if self._path:
-            nx, ny = self._path[0]
-            if tilemap.get(nx, ny) == BRICK:
-                self.direction = (nx - self.x, ny - self.y)
-                self.try_shoot()
-                return   # wait for wall to be destroyed
+        # ── Wall Rule: if next tile in current direction is Brick → shoot ─
+        look_x = self.x + self.direction[0]
+        look_y = self.y + self.direction[1]
+        if tilemap.get(look_x, look_y) == BRICK:
+            self.try_shoot()
+            return   # wait for wall to be destroyed before moving
 
-        # Movement
+        # ── Movement Rule: follow BFS path or random fallback ─────────────
         if self.can_move():
             if self._path:
                 nx, ny = self._path[0]
                 if self.try_move(tilemap, nx - self.x, ny - self.y, occupied=occupied):
                     self._path.pop(0)
                 else:
-                    # Blocked by something other than brick — replan
+                    # Path blocked — replan next tick
                     self._path = []
                     self.try_move(tilemap, *random.choice(DIRS), occupied=occupied)
             else:
-                # Random fallback
+                # No BFS path exists — turn to a random free direction
                 d = random.choice(DIRS)
                 self.try_move(tilemap, *d, occupied=occupied)
             self.reset_move_tick()
+
+
 # ─── Fast Tank (Goal-Based + Greedy Best-First) ───────────────────────────────
 
 class FastTank(Tank):
     """
-    Goal-Based Agent — single goal: destroy Eagle.
-    Greedy best-first: uses greedy_path to navigate toward Eagle.
-    Ignores player entirely.
+    Goal-Based Agent — single goal: reach and destroy the Eagle.
+    Ignores player completely.
+    Movement: Greedy Best-First single-step decision — on every tick, pick
+              the neighbour tile with the lowest Manhattan distance to Eagle.
+    Wall Rule: IF next tile is Brick THEN shoot it to clear the path.
+               Do NOT detour — push straight through.
+    Can get stuck in local minima — this is intentional.
     """
 
     def __init__(self, x, y, level=1):
         super().__init__(x, y, TANK_FAST)
         self.direction = DOWN
-        self.fire_rate = 100 if level == 1 else 80   # slower on level 1
+        self.fire_rate = 100 if level == 1 else 80
         self.speed     = max(1, SPEED[TANK_FAST] - 4)
-        self._path     = []
-        self._replan_cd = 0
 
     def update(self, tilemap, player, occupied=None):
         self.tick_cooldowns()
 
-        self._replan_cd -= 1
-        if self._replan_cd <= 0 or not self._path:
-            self._path = tilemap.greedy_path((self.x, self.y), EAGLE_POS)
-            self._replan_cd = FPS * 5
+        # ── Greedy Best-First: recompute single step every tick ────────────
+        # No full path — just pick the neighbour with lowest h(n)
+        next_step = tilemap.greedy_next_step((self.x, self.y), EAGLE_POS)
 
-        if self._path:
-            nx, ny = self._path[0]
+        # ── Wall Rule: shoot brick to push straight through ───────────────
+        if next_step:
+            nx, ny = next_step[0]
             if tilemap.get(nx, ny) == BRICK:
                 self.direction = (nx - self.x, ny - self.y)
                 self.try_shoot()
-                return
+                return   # wait for brick to break
 
+        # ── Movement: follow the greedy step ──────────────────────────────
         if self.can_move():
-            if self._path:
-                nx, ny = self._path[0]
-                if self.try_move(tilemap, nx - self.x, ny - self.y, occupied=occupied):
-                    self._path.pop(0)
-                else:
-                    self._path = []
-                    self.try_move(tilemap, *random.choice(DIRS), occupied=occupied)
+            if next_step:
+                nx, ny = next_step[0]
+                if not self.try_move(tilemap, nx - self.x, ny - self.y, occupied=occupied):
+                    # Stuck (occupied by another tank) — wait, don't detour
+                    pass
             else:
+                # Local minimum — no valid neighbour, random fallback
                 self.try_move(tilemap, *random.choice(DIRS), occupied=occupied)
             self.reset_move_tick()
+
 
 
 # ─── Armor Tank (Model-Based Reflex + A*) ─────────────────────────────────────
 
 class ArmorTank(Tank):
     """
-    Model-Based Reflex Agent — tracks hit_count internally.
-    A* for navigation; retreats to steel cover on 3rd hit.
+    Model-Based Reflex Agent — maintains internal state (hitCount).
+    Changes behavior when damaged.
+    State Variable: hitCount (0 to 3). Tracks hits. Persists across ticks.
+    Rule 1 (0-2 hits): Navigate toward Eagle using A*. If player in LoS, shoot.
+    Rule 2 (3rd hit):  RETREAT. Abandon A* path. Find nearest Steel Wall via
+                       BFS and move behind it for cover.
+    Rule 3 (after retreat): Wait 2s behind cover, then recompute A* to Eagle.
+    A* details:
+      h(n) = Manhattan distance to Eagle (admissible).
+      g(n) costs: Empty=1, Forest=1, Brick=3, Steel=∞, Water=∞.
+      Re-run A* at spawn, after retreating to cover, and on map changes.
     """
 
     def __init__(self, x, y, level=1):
@@ -251,13 +270,16 @@ class ArmorTank(Tank):
         self._path       = []
         self._state      = "attack"    # "attack" | "retreat" | "cover"
         self._cover_cd   = 0
+        self._hit_count  = 0           # Model-based state variable
         self._sight_ticks = 0
 
     def take_hit(self):
         super().take_hit()
-        if self.hp == 1 and self._state == "attack":   # 3rd hit (hp 4→1)
+        self._hit_count += 1
+        # Rule 2: on 3rd hit → RETREAT to steel cover
+        if self._hit_count >= 3 and self._state == "attack":
             self._state = "retreat"
-            self._path  = []
+            self._path  = []           # abandon current A* path
         return self.alive
 
     def _find_cover(self, tilemap):
@@ -280,7 +302,7 @@ class ArmorTank(Tank):
     def update(self, tilemap, player, occupied=None):
         self.tick_cooldowns()
 
-        # Shoot player if in line-of-sight
+        # ── Rule 1: Shoot player if in line-of-sight (attack & retreat) ───
         if self.line_of_sight(tilemap, player.x, player.y):
             self._sight_ticks += 1
             if self._sight_ticks >= 60:
@@ -291,6 +313,7 @@ class ArmorTank(Tank):
         else:
             self._sight_ticks = 0
 
+        # ── Rule 2: RETREAT — find nearest steel wall for cover ───────────
         if self._state == "retreat":
             if not self._path:
                 self._path = self._find_cover(tilemap)
@@ -302,20 +325,22 @@ class ArmorTank(Tank):
                     self._path.pop(0)
                     if not self._path:
                         self._state  = "cover"
-                        self._cover_cd = FPS * 2
+                        self._cover_cd = FPS * 2    # wait 2 seconds
                 self.reset_move_tick()
 
+        # ── Rule 3: COVER — wait 2s then recompute A* and resume attack ──
         elif self._state == "cover":
             self._cover_cd -= 1
             if self._cover_cd <= 0:
                 self._state = "attack"
                 self._path  = tilemap.astar_path((self.x, self.y), EAGLE_POS)
 
-        else:  # attack
+        # ── ATTACK — A* navigation to Eagle ──────────────────────────────
+        else:
             if not self._path:
                 self._path = tilemap.astar_path((self.x, self.y), EAGLE_POS)
 
-            # Wall rule — shoot through brick in A* path
+            # A* wall rule: shoot through brick strategically (cost 3 < detour)
             if self._path:
                 nx, ny = self._path[0]
                 if tilemap.get(nx, ny) == BRICK:

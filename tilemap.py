@@ -45,8 +45,10 @@ class Tilemap:
 
     def bfs_path(self, start, goal):
         """
-        Standard BFS. Returns list of (x,y) steps from start→goal,
-        or [] if unreachable. Only traverses EMPTY and FOREST tiles.
+        Standard queue-based BFS.
+        Returns list of (x,y) steps from start→goal, or [] if unreachable.
+        Treats all passable tiles (Empty, Forest) as equal cost = 1.
+        Does NOT consider shooting through brick — only open paths.
         """
         sx, sy = start
         gx, gy = goal
@@ -60,11 +62,12 @@ class Tilemap:
                 nx, ny = cx + dx, cy + dy
                 if (nx, ny) in visited:
                     continue
+                visited.add((nx, ny))
                 new_path = path + [(nx, ny)]
                 if (nx, ny) == (gx, gy):
                     return new_path
-                if self.is_passable(nx, ny) or self.get(nx, ny) == BRICK:
-                    visited.add((nx, ny))
+                # BFS only traverses passable tiles (EMPTY, FOREST)
+                if self.is_passable(nx, ny):
                     queue.append(((nx, ny), new_path))
         return []
 
@@ -75,19 +78,25 @@ class Tilemap:
 
     def astar_path(self, start, goal):
         """
-        A* with per-tile g-costs:
-            empty/forest = 1,  brick = 3,  steel/water = ∞
+        A* with per-tile g-costs (cost-aware pathfinding):
+            Empty = 1, Forest = 1, Brick = 3 (shoot + wait penalty),
+            Steel = ∞ (blocked), Water = ∞ (blocked).
+        Heuristic h(n): Manhattan distance to Eagle — admissible.
         Returns list of (x,y) steps or [].
         """
         import heapq
 
-        COST = {EMPTY: 1, FOREST: 1, BRICK: 3, STEEL: 999, WATER: 999}
+        # g(n) costs per tile type
+        TILE_COST = {EMPTY: 1, FOREST: 1, BRICK: 3}
+        # Steel and Water are impassable (infinite cost) — not in dict
 
         def h(x, y):
+            """Manhattan distance heuristic — admissible, never overestimates."""
             return abs(x - goal[0]) + abs(y - goal[1])
 
+        # Priority queue: (f, g, position, path)
         open_set = [(h(*start), 0, start, [])]
-        visited  = {}
+        visited  = {}  # maps (x,y) → best g cost seen
 
         while open_set:
             f, g, (cx, cy), path = heapq.heappop(open_set)
@@ -102,45 +111,52 @@ class Tilemap:
                     continue
                 if (nx, ny) in visited:
                     continue
+                # Goal tile is always reachable
                 if (nx, ny) == goal:
                     return path + [(nx, ny)]
-                tile   = self.get(nx, ny)
-                cost   = COST.get(tile, 999)
-                if cost >= 999:
-                    continue
-                ng     = g + cost
-                npath  = path + [(nx, ny)]
+                tile = self.get(nx, ny)
+                cost = TILE_COST.get(tile)
+                if cost is None:
+                    continue          # Steel/Water → impassable, skip
+                ng    = g + cost
+                npath = path + [(nx, ny)]
                 heapq.heappush(open_set, (ng + h(nx, ny), ng, (nx, ny), npath))
         return []
 
-    def greedy_path(self, start, goal):
-        import heapq
-        open_set = [(abs(start[0] - goal[0]) + abs(start[1] - goal[1]), start, [])]
-        visited = set()
+    def greedy_next_step(self, start, goal):
+        """
+        Greedy Best-First single-step decision.
+        Does NOT compute a full path — simply picks the neighbour tile
+        with the lowest Manhattan distance h(n) to the goal.
+        Returns a 1-element list [(nx, ny)] or [] if stuck.
         
-        while open_set:
-            h_val, (cx, cy), path = heapq.heappop(open_set)
-            if (cx, cy) in visited:
+        Consequence: Can get stuck in local minima (e.g., surrounded by
+        walls with one opening behind it). This is intentional — it shows
+        WHY greedy search is not optimal.
+        """
+        sx, sy = start
+        gx, gy = goal
+        if (sx, sy) == (gx, gy):
+            return []
+
+        best_tile = None
+        best_h    = float('inf')
+
+        for dx, dy in DIRS:
+            nx, ny = sx + dx, sy + dy
+            if not (0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE):
                 continue
-            visited.add((cx, cy))
-            
-            if (cx, cy) == goal:
-                return path
-                
-            for dx, dy in DIRS:
-                nx, ny = cx + dx, cy + dy
-                if not (0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE):
-                    continue
-                if (nx, ny) in visited:
-                    continue
-                if (nx, ny) == goal:
-                    return path + [(nx, ny)]
-                
-                tile = self.get(nx, ny)
-                if tile in (EMPTY, FOREST, BRICK):
-                    h_next = abs(nx - goal[0]) + abs(ny - goal[1])
-                    heapq.heappush(open_set, (h_next, (nx, ny), path + [(nx, ny)]))
-        return []
+            tile = self.get(nx, ny)
+            # Can move through passable tiles or shoot through brick
+            if tile in (EMPTY, FOREST, BRICK) or (nx, ny) == (gx, gy):
+                h = abs(nx - gx) + abs(ny - gy)
+                if h < best_h:
+                    best_h    = h
+                    best_tile = (nx, ny)
+
+        if best_tile is not None:
+            return [best_tile]
+        return []  # stuck — no valid neighbours
 
 
 # ─── Map Generator (CSP with Backtracking Attempts) ─────────────────────────────────────
